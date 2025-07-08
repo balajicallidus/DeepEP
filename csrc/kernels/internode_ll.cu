@@ -483,7 +483,7 @@ compress_logfmt(void* rdma_recv_x, void* rdma_send_x,
 
             constexpr int kPrefetchCount = 2;
             constexpr float kThreshold = 1.0f;
-            constexpr float kLogThreshold = 10.0f; // __logf(kThreshold)
+            constexpr float kLogThreshold = 10000.0f; // __logf(kThreshold)
             constexpr float kMinClip = 22.1807097779182499013514278f; // `== log(2 ^ (2 ^ 5))`
             constexpr int kNumBits = 10;
             constexpr unsigned int kNumValues = 1 << (kNumBits - 1);
@@ -836,6 +836,7 @@ if constexpr (kUseLogFMT){
                     half_warp_flag += 1 << channel_group_id_in_segment;
                 }
             }
+            const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
             int first_half_warp_flag = __shfl_sync(0xffffffff, half_warp_flag, 0);
             if (my_store_idx >= 0) {
                 int dst_int64_ptr_offset = initial_dst_int64_ptr_offset - half_log_amax_amin_bytes_per_combine_msg / sizeof(int64_t);
@@ -843,6 +844,27 @@ if constexpr (kUseLogFMT){
             }
             if (lane_id == 32 - 1) {
                 st_na_global(reinterpret_cast<int*>(cpy_dst_int64_ptr) + sub_warp_id, half_warp_flag + first_half_warp_flag);
+            }
+            size_t buf_bytes = (hidden_bf16_int4 / kNumWarpsPerGroup / 32 * 2 - log_a_store_idx) * (128 * sizeof(nv_bfloat16) - (128 * kNumBits / 8)) + (1 - sub_warp_id) * sizeof(int4) + (kHidden / 2 * kNumBits / 8 + half_log_amax_amin_bytes_per_combine_msg);
+
+            if (dst_p2p_ptr == 0) {
+                const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
+                if (sub_warp_id == 0){
+                    nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, buf_bytes, dst_rank, local_expert_idx, lane_id, 0);
+                } else {
+                    nvshmemi_ibgda_put_nbi_warp(dst_ptr + (kHidden / 2 * sizeof(nv_bfloat16) + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg), buf_ptr + (kHidden / 2 * sizeof(nv_bfloat16) + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg), buf_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                }
+            } else {
+                const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
+                {
+                    if (rank != dst_rank) {
+                        if (sub_warp_id == 0) {
+                        UNROLLED_WARP_COPY(7, lane_id, buf_bytes / sizeof(int4), dst_int4_ptr, reinterpret_cast<int4*>(buf_ptr), ld_nc_global, st_na_global);
+                        } else {
+                        UNROLLED_WARP_COPY(7, lane_id, buf_bytes / sizeof(int4), dst_int4_ptr + (kHidden / 2 * sizeof(nv_bfloat16) + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg) / sizeof(int4), reinterpret_cast<int4*>(buf_ptr + (kHidden / 2 * sizeof(nv_bfloat16) + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg)), ld_nc_global, st_na_global);
+                        }
+                    }
+                }
             }
 
             token_idx += (1024 / 32 / kNumWarpsPerGroup) * num_sms;
@@ -892,7 +914,7 @@ if constexpr (kUseLogFMT){
             const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
             const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
             size_t buf_bytes[2];
-            if constexpr (kUseLogFMT) {
+            /*if constexpr (kUseLogFMT) {
                 int uncompressed_cnt;
                 if (lane_id < 2) {
                     unsigned int flag = ld_nc_global(reinterpret_cast<const int*>(rank == dst_rank ? dst_ptr : buf_ptr) + lane_id);
@@ -900,27 +922,27 @@ if constexpr (kUseLogFMT){
                 }
                 buf_bytes[0] = __shfl_sync(0xffffffff, uncompressed_cnt, 0) * (128 * sizeof(nv_bfloat16) - (128 * kNumBits / 8)) + (kHidden / 2 * kNumBits / 8 + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg);
                 buf_bytes[1] = __shfl_sync(0xffffffff, uncompressed_cnt, 1) * (128 * sizeof(nv_bfloat16) - (128 * kNumBits / 8)) + (kHidden / 2 * kNumBits / 8 + half_log_amax_amin_bytes_per_combine_msg);
-            }
+            }*/
             if (dst_p2p_ptr == 0) {
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                 if constexpr (not kUseLogFMT) {
                     if (not zero_copy)
                         UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, hidden * sizeof(nv_bfloat16), dst_rank, local_expert_idx, lane_id, token_idx - offset);
-                } else {
+                }/* else {
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, buf_bytes[0], dst_rank, local_expert_idx, lane_id, 0);
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr + (kHidden / 2 * sizeof(nv_bfloat16) + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg), buf_ptr + (kHidden / 2 * sizeof(nv_bfloat16) + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg), buf_bytes[1], dst_rank, local_expert_idx, lane_id, token_idx - offset);
-                }
+                }*/
             } else {
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
                 if constexpr (not kUseLogFMT) {
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
-                } else {
+                }/* else {
                     if (rank != dst_rank) {
                         UNROLLED_WARP_COPY(7, lane_id, buf_bytes[0] / sizeof(int4), dst_int4_ptr, reinterpret_cast<int4*>(buf_ptr), ld_nc_global, st_na_global);
                         UNROLLED_WARP_COPY(7, lane_id, buf_bytes[1] / sizeof(int4), dst_int4_ptr + (kHidden / 2 * sizeof(nv_bfloat16) + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg) / sizeof(int4), reinterpret_cast<int4*>(buf_ptr + (kHidden / 2 * sizeof(nv_bfloat16) + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg)), ld_nc_global, st_na_global);
                     }
-                }
+                }*/
             }
         }
 
