@@ -675,7 +675,7 @@ if constexpr (kUseLogFMT){
     EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
 
     __shared__ int32_t shared_packed_recv_count[32];
-    __shared__ int64_t shared_layout_range[288];
+    __shared__ int64_t shared_layout_range[1024];
     if (thread_id < num_local_experts * num_ranks) {
         shared_layout_range[thread_id] = __ldg(layout_range + thread_id);
     }
@@ -1119,6 +1119,8 @@ void combine(void* combined_x,
              bool use_logfmt,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy) {
+    EP_HOST_ASSERT(num_experts <= 1024);
+    EP_HOST_ASSERT(num_experts / num_ranks <= 32);
     constexpr int kNumMaxTopk = 9;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
