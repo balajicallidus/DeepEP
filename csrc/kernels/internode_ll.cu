@@ -648,6 +648,7 @@ combine(void* combined_x,
     constexpr size_t num_bytes_per_slot = kHidden * sizeof(nv_bfloat16) + sizeof(int4) + half_log_amax_amin_bytes_per_combine_msg * 2;
     EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
 
+            constexpr int kUnrollFactor = 2;
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_COMBINE_RECV;
@@ -664,6 +665,8 @@ if constexpr (kUseLogFMT){
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     int token_idx = warp_group_id * num_sms + sm_id;
     const auto lane_group_id = lane_id / 16, sub_lane_id = lane_id % 16;
+    const auto lane8_group_id = lane_id / 8, sub_lane8_id = lane_id % 8;
+    const auto lane8_group_id_div_2 = lane8_group_id % 2;
 
     // Data type staffs
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
@@ -741,12 +744,13 @@ if constexpr (kUseLogFMT){
             const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
             const auto cpy_src_int4_ptr = x_int4 + hidden_bf16_int4 / kNumWarpsPerGroup * sub_warp_id;
             const auto cpy_dst_int64_ptr = reinterpret_cast<int64_t*>(rank == dst_rank ? dst_ptr : buf_ptr);
+            const auto cpy_dst_int4_ptr = reinterpret_cast<int4*>(cpy_dst_int64_ptr);
 
             const int initial_dst_int64_ptr_offset = sizeof(int4) / sizeof(int64_t) + half_log_amax_amin_bytes_per_combine_msg / sizeof(int64_t) + (half_log_amax_amin_bytes_per_combine_msg / sizeof(int64_t) + hidden_bf16_int4 / kNumWarpsPerGroup * (sizeof(int4) / sizeof(int64_t))) * sub_warp_id;
 
-            constexpr int kPrefetchCount = 2;
+            constexpr int kPrefetchCount = 1;
             constexpr float kThreshold = 1.0f;
-            constexpr float kLogThreshold = 10.0f; // __logf(kThreshold)
+            constexpr float kLogThreshold = 10000.0f; // __logf(kThreshold)
             constexpr float kMinClip = 22.1807097779182499013514278f; // `== log(2 ^ (2 ^ 5))`
             constexpr int kNumBits = 10;
             constexpr unsigned int kNumValues = 1 << (kNumBits - 1);
@@ -758,10 +762,12 @@ if constexpr (kUseLogFMT){
             if constexpr (kPrefetchCount > 1) {
                 #pragma unroll
                 for (int k = 0; k < kPrefetchCount; k++) {
-                    asm volatile("prefetch.global.L1 [%0];" :: "l"(cpy_src_int4_ptr + (lane_id + k * 32)));
+                        #pragma unroll
+                        for (int p = 0; p < kUnrollFactor; ++ p)
+                    asm volatile("prefetch.global.L1 [%0];" :: "l"(cpy_src_int4_ptr + (lane_id * kUnrollFactor + k * (kUnrollFactor * 32) + p)));
                 }
             }
-            int prefetch_i = lane_id + kPrefetchCount * 32;
+            int prefetch_i = lane_id * kUnrollFactor + kPrefetchCount * (kUnrollFactor * 32);
 
             int half_warp_flag = 0;
             int log_a_store_idx = 0;
@@ -769,19 +775,41 @@ if constexpr (kUseLogFMT){
             nv_bfloat16 my_amax, my_amin;
 
             #pragma unroll
-            for (int k = 0, channel_group_id_in_segment = lane_group_id; k * 32 < hidden_bf16_int4 / kNumWarpsPerGroup; k++, channel_group_id_in_segment += 2) {
+            for (int k = 0, channel_group_id_in_segment = lane8_group_id; k * (kUnrollFactor * 32) < hidden_bf16_int4 / kNumWarpsPerGroup; k++, channel_group_id_in_segment += 4) {
                 // Read
-                auto int4_value = ld_nc_global(cpy_src_int4_ptr + (lane_id + k * 32));
+                    int4 int4_values[kUnrollFactor];
+                    {
+                        #pragma unroll
+                        for (int p = 0; p < kUnrollFactor; ++ p)
+                            int4_values[p] = ld_nc_global(cpy_src_int4_ptr + (lane_id * kUnrollFactor + k * (kUnrollFactor * 32) + p));
+                        /*int4_values[0].x=(lane_id * kUnrollFactor + k * (kUnrollFactor * 32)) * 2 + sub_warp_id;
+                        int4_values[0].y=(lane_id * kUnrollFactor + k * (kUnrollFactor * 32)) * 2 + sub_warp_id;
+                        int4_values[0].z=(lane_id * kUnrollFactor + k * (kUnrollFactor * 32)) * 2 + sub_warp_id;
+                        int4_values[0].w=(lane_id * kUnrollFactor + k * (kUnrollFactor * 32)) * 2 + sub_warp_id;
+                        int4_values[1].x=(lane_id * kUnrollFactor + k * (kUnrollFactor * 32) + 1) * 2 + sub_warp_id;
+                        int4_values[1].y=(lane_id * kUnrollFactor + k * (kUnrollFactor * 32) + 1) * 2 + sub_warp_id;
+                        int4_values[1].z=(lane_id * kUnrollFactor + k * (kUnrollFactor * 32) + 1) * 2 + sub_warp_id;
+                        int4_values[1].w=(lane_id * kUnrollFactor + k * (kUnrollFactor * 32) + 1) * 2 + sub_warp_id;*/
+                        /*if (lane_id * kUnrollFactor + k * (kUnrollFactor * 32) + 1 == 15) {
+                            EP_DEVICE_ASSERT(int4_values[1].w == 0 || int4_values[1].w == 1<<31);
+                        }*/
+                    }
+                //auto int4_value = ld_nc_global(cpy_src_int4_ptr + (lane_id + k * 32));
                 if (prefetch_i < hidden_bf16_int4 / kNumWarpsPerGroup) {
-                    asm volatile("prefetch.global.L1 [%0];" :: "l"(cpy_src_int4_ptr + (prefetch_i)));
-                    prefetch_i += 32;
+                        #pragma unroll
+                        for (int p = 0; p < kUnrollFactor; ++ p)
+                    asm volatile("prefetch.global.L1 [%0];" :: "l"(cpy_src_int4_ptr + (prefetch_i + p)));
+                    prefetch_i += kUnrollFactor * 32;
                 }
-                auto bf162_values = reinterpret_cast<const nv_bfloat162*>(&int4_value);
+                //auto bf162_values = reinterpret_cast<const nv_bfloat162*>(&int4_value);
+                auto bf162_values = reinterpret_cast<const nv_bfloat162*>(int4_values);
 
                 // Local log amax
-                nv_bfloat162 bf16_abs_values[kNumElemsPerInt4 / 2], amaxs, amins;
+                nv_bfloat162 bf16_abs_values[kUnrollFactor * kNumElemsPerInt4 / 2], amaxs, amins;
                 #pragma unroll
-                for (int j = 0; j < kNumElemsPerInt4 / 2; ++ j) {
+                for (int j = 0; j < kUnrollFactor * kNumElemsPerInt4 / 2; ++ j) {
+                    /*bf162_values[j].x=nv_bfloat16(3);
+                    bf162_values[j].y=nv_bfloat16(-4);*/
                     bf16_abs_values[j] = __habs2(bf162_values[j]);
                     amaxs = j == 0 ? bf16_abs_values[j] : __hmax2(amaxs, bf16_abs_values[j]);
                     amins = j == 0 ? bf16_abs_values[j] : __hmin2(amins, bf16_abs_values[j]);
@@ -789,14 +817,17 @@ if constexpr (kUseLogFMT){
                 nv_bfloat16 amax = __hmax(amaxs.x, amaxs.y), amin = __hmin(amins.x, amins.y);
 
                 // Reduce per 128 channels
-                amax = half_warp_reduce_max(amax);
-                amin = half_warp_reduce_min(amin);
+                amax = lane8_reduce_max(amax, 0xffffffff);
+                amin = lane8_reduce_min(amin, 0xffffffff);
                 float log_amax = __logf(static_cast<float>(amax));
                 float log_amin = fmaxf(__logf(static_cast<float>(amin)), log_amax - kMinClip);
 
-                int is_peer_half_warp_compressed = __shfl_xor_sync(0xffffffff, log_amax <= kLogThreshold, 16);
+                int is_self_compressed = log_amax <= kLogThreshold;
+                int is_peer_lane8_compressed = 1;//__shfl_xor_sync(0xffffffff, is_self_compressed, 8);
+                ;
+                int is_peer_half_warp_compressed = 2;//__shfl_xor_sync(0xffffffff, is_self_compressed+is_peer_lane8_compressed, 16);
                 // Use LogFMT only with `amax <= kThreshold` (maybe not all half-warps)
-                if (log_amax <= kLogThreshold) {
+                if (is_self_compressed) {
                     //const auto step = (log_amax - log_amin) / static_cast<float>(kNumValues - 2);
                     const auto inv_step = __fdividef(static_cast<float>(kNumValues - 2), log_amax - log_amin);// / (log_amax - log_amin);
                     const auto rounding = 1.5f;//2.0f - __logf((1.0f + __expf(__fdividef(1.0f, inv_step))) / 2.0f) * inv_step;
@@ -806,44 +837,58 @@ if constexpr (kUseLogFMT){
                         const auto encoded = (static_cast<unsigned int>(fmaxf((log_abs_value - log_amin) * inv_step + rounding, 0.0f))) & (kNumValues - 1);
                         return value < CUDART_ZERO_BF16 ? kNumValues + encoded : encoded;
                     };
-                    unsigned int out[kNumElemsPerInt4];
+                    unsigned int out[kUnrollFactor * kNumElemsPerInt4];
                     #pragma unroll
-                    for (int j = 0; j < kNumElemsPerInt4 / 2; ++ j) {
+                    for (int j = 0; j < kUnrollFactor * kNumElemsPerInt4 / 2; ++ j) {
                         float2 abs_values = __bfloat1622float2(bf16_abs_values[j]);
                         out[j * 2] = encode(bf162_values[j].x, __logf(abs_values.x));
                         out[j * 2 + 1] = encode(bf162_values[j].y, __logf(abs_values.y));
                     }
-                    uint32_t out32[2];
+                    /*uint32_t out32[2];
                     out32[0] = (out[0] << (kNumBits * 2)) + (out[1] << (kNumBits * 1)) + (out[3] << (kNumBits * 3)) + out[2];
                     out32[1] = (out[4] << (32 - kNumBits * 1)) + (out[5] << (32 - kNumBits * 2)) + (out[3] >> (10 - (32 - kNumBits * 3))) + (out[6] << (32 - kNumBits * 3));
-                    uint16_t out16 = ((out[3] & 0b0011111100u) << (10 - (32 - kNumBits * 3))) + out[7];
+                    uint16_t out16 = ((out[3] & 0b0011111100u) << (10 - (32 - kNumBits * 3))) + out[7];*/
+                    uint32_t out32[5];
+                    out32[0] = (out[0] << (kNumBits * 2)) + (out[1] << (kNumBits * 1)) + (out[3] << (kNumBits * 3)) + out[2];
+                    out32[1] = (out[4] << (32 - kNumBits * 1)) + (out[5] << (32 - kNumBits * 2)) + (out[3] >> (10 - (32 - kNumBits * 3))) + (out[6] << (32 - kNumBits * 3));
+                    out32[2] = (out[7] << (kNumBits * 2)) + (out[8] << (kNumBits * 1)) + ((out[3] & 0b0000001100u) << (28)) + out[9];
+                    out32[3] = (out[10] << (kNumBits * 2)) + (out[11] << (kNumBits * 1)) + ((out[3] & 0b0000110000u) << (26)) + out[12];
+                    out32[4] = (out[13] << (kNumBits * 2)) + (out[14] << (kNumBits * 1)) + ((out[3] & 0b0011000000u) << (24)) + out[15];
 
                     log_a_store_idx += lane_group_id * is_peer_half_warp_compressed;
+                    log_a_store_idx += lane8_group_id_div_2 * is_peer_lane8_compressed;
                     int dst_int64_ptr_offset = initial_dst_int64_ptr_offset + channel_group_id_in_segment * (16 * 2) - log_a_store_idx * (16 * 2 - 10 * 2);
-                    st_na_global(cpy_dst_int64_ptr + (dst_int64_ptr_offset + sub_lane_id), *reinterpret_cast<const int64_t*>(out32));
-                    st_na_global(reinterpret_cast<uint16_t*>(cpy_dst_int64_ptr) + ((dst_int64_ptr_offset + 16) * (sizeof(int64_t) / sizeof(uint16_t)) + sub_lane_id), out16);
-                    if (sub_lane_id == k) {
+                    st_na_global(cpy_dst_int4_ptr + (dst_int64_ptr_offset / 2 + sub_lane8_id), *reinterpret_cast<const int4*>(out32));
+                    st_na_global(reinterpret_cast<int32_t*>(cpy_dst_int64_ptr) + (dst_int64_ptr_offset * 2 + 8 * 4 + sub_lane8_id), *reinterpret_cast<const int32_t*>(out32 + 4));
+                    /*st_na_global(cpy_dst_int64_ptr + (dst_int64_ptr_offset + sub_lane_id), *reinterpret_cast<const int64_t*>(out32));
+                    st_na_global(reinterpret_cast<uint16_t*>(cpy_dst_int64_ptr) + ((dst_int64_ptr_offset + 16) * (sizeof(int64_t) / sizeof(uint16_t)) + sub_lane_id), out16);*/
+                    if (sub_lane8_id == k) {
                         my_store_idx = channel_group_id_in_segment;
                         my_amax = amax;
                         my_amin = amin;
                     }
+                    log_a_store_idx += (1 - lane8_group_id_div_2) * is_peer_lane8_compressed;
                     log_a_store_idx += 1 + (1 - lane_group_id) * is_peer_half_warp_compressed;
                 } else {
                     log_a_store_idx += lane_group_id * is_peer_half_warp_compressed;
+                    log_a_store_idx += lane8_group_id_div_2 * is_peer_lane8_compressed;
                     int dst_int64_ptr_offset = initial_dst_int64_ptr_offset + channel_group_id_in_segment * (16 * 2) - log_a_store_idx * (16 * 2 - 10 * 2);
-                    st_na_global(reinterpret_cast<int4*>(cpy_dst_int64_ptr) + (dst_int64_ptr_offset / (sizeof(int4) / sizeof(int64_t)) + sub_lane_id), int4_value);
+                    st_na_global(reinterpret_cast<int4*>(cpy_dst_int64_ptr) + (dst_int64_ptr_offset / (sizeof(int4) / sizeof(int64_t)) + sub_lane8_id * kUnrollFactor), int4_values[0]);
+                    st_na_global(reinterpret_cast<int4*>(cpy_dst_int64_ptr) + (dst_int64_ptr_offset / (sizeof(int4) / sizeof(int64_t)) + sub_lane8_id * kUnrollFactor + 1), int4_values[1]);
+                    log_a_store_idx += (1 - lane8_group_id_div_2) * is_peer_lane8_compressed;
                     log_a_store_idx += 0 + (1 - lane_group_id) * is_peer_half_warp_compressed;
                     half_warp_flag += 1 << channel_group_id_in_segment;
                 }
             }
             const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
-            int first_half_warp_flag = __shfl_sync(0xffffffff, half_warp_flag, 0);
+            int first_lane8_flag = __shfl_xor_sync(0xffffffff, half_warp_flag, 8);
+            int first_half_warp_flag = __shfl_sync(0xffffffff, first_lane8_flag+half_warp_flag, 0);
             if (my_store_idx >= 0) {
                 int dst_int64_ptr_offset = initial_dst_int64_ptr_offset - half_log_amax_amin_bytes_per_combine_msg / sizeof(int64_t);
                 st_na_global(reinterpret_cast<int*>(cpy_dst_int64_ptr) + (dst_int64_ptr_offset * (sizeof(int64_t) / sizeof(int)) + my_store_idx), pack2<nv_bfloat16, int>(my_amax, my_amin));
             }
             if (lane_id == 32 - 1) {
-                st_na_global(reinterpret_cast<int*>(cpy_dst_int64_ptr) + sub_warp_id, half_warp_flag + first_half_warp_flag);
+                st_na_global(reinterpret_cast<int*>(cpy_dst_int64_ptr) + sub_warp_id, first_lane8_flag+half_warp_flag + first_half_warp_flag);
             }
             size_t buf_bytes = (hidden_bf16_int4 / kNumWarpsPerGroup / 32 * 2 - log_a_store_idx) * (128 * sizeof(nv_bfloat16) - (128 * kNumBits / 8)) + (1 - sub_warp_id) * sizeof(int4) + (kHidden / 2 * kNumBits / 8 + half_log_amax_amin_bytes_per_combine_msg);
 
@@ -968,11 +1013,14 @@ if constexpr (kUseLogFMT){
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
         return;
 
-    const auto thread_group_id = __shfl_sync(0xffffffff, thread_id / static_cast<int>(hidden_bf16_int4 / 2), 0);
-    const auto sub_thread_id = thread_id % static_cast<int>(hidden_bf16_int4 / 2);
-    const auto channel_group_id_in_segment = sub_thread_id / (128 / kNumElemsPerInt4);
-    const auto thread_id_in_channel_group = sub_thread_id % (128 / kNumElemsPerInt4);
-    const unsigned int sync_mask = lane_id < 16 ? 0x0000ffff : 0xffff0000;
+    const auto sm_thread_id = thread_id / static_cast<int>(hidden_bf16_int4 / kUnrollFactor);
+    const auto actual_thread_id = thread_id % static_cast<int>(hidden_bf16_int4 / kUnrollFactor);
+        const auto thread_group_id = __shfl_sync(0xffffffff, actual_thread_id / static_cast<int>(hidden_bf16_int4 / kUnrollFactor / 2), 0);
+    const auto sub_thread_id = actual_thread_id % static_cast<int>(hidden_bf16_int4 / kUnrollFactor / 2);
+    const auto channel_group_id_in_segment = sub_thread_id / (128 / kNumElemsPerInt4 / kUnrollFactor);
+    const auto thread_id_in_channel_group = sub_thread_id % (128 / kNumElemsPerInt4 / kUnrollFactor);
+    const auto thread_id_in_lane8_group = sub_thread_id % 8;
+    const unsigned int sync_mask = lane_id < 16 ? (lane_id < 8 ? 0x000000ff : 0x0000ff00) : (lane_id < 24 ? 0x00ff0000 : 0xff000000);
     const int amax_amin_bf162_ptr_base_offset = sizeof(int4) / sizeof(nv_bfloat162) + ((half_log_amax_amin_bytes_per_combine_msg + kHidden / 2 * sizeof(nv_bfloat16)) / sizeof(nv_bfloat162)) * thread_group_id;
     const int amax_amin_bf162_ptr_offset = amax_amin_bf162_ptr_base_offset + channel_group_id_in_segment;
     const int data_int64_ptr_base_offset = amax_amin_bf162_ptr_base_offset / (sizeof(int64_t) / sizeof(nv_bfloat162)) + half_log_amax_amin_bytes_per_combine_msg / sizeof(int64_t);
@@ -992,8 +1040,8 @@ if constexpr (kUseLogFMT){
     // Reduce tokens
     EP_DEVICE_ASSERT(num_topk <= 16 and hidden_bf16_int4 <= num_threads);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
-    if (thread_id < hidden_bf16_int4) {
-        for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
+    if (actual_thread_id < (hidden_bf16_int4 / kUnrollFactor)) {
+        for (int token_idx = sm_thread_id * num_sms + sm_id; token_idx < num_combined_tokens; token_idx += num_sms * 2) {
             // Read top-k indices and weights
             int reg_topk_idx[kNumMaxTopk];
             float reg_topk_weights[kNumMaxTopk];
@@ -1017,36 +1065,77 @@ if constexpr (kUseLogFMT){
                 reg_topk_weights[i] = __ldg(topk_weights + token_idx * num_topk + i);
             }
 
-            float combined_values[kNumElemsPerInt4] = {0.0f};
+            float combined_values[kNumElemsPerInt4 * 2] = {0.0f};
             #pragma unroll
-            for (int i = 0; i < num_topk; ++ i) if (int reg_topk_idx_i = __shfl_sync(sync_mask, local_reg_topk_idx, i, 16); reg_topk_idx_i >= 0) {
+            for (int i = 0; i < num_topk; ++ i) if (int reg_topk_idx_i = __shfl_sync(0xffffffff, local_reg_topk_idx, i, 8); reg_topk_idx_i >= 0) {
                 // Read from sources
                 auto rdma_buffer_type = reinterpret_cast<const int64_t*>(static_cast<uint8_t*>(rdma_recv_x) + (reg_topk_idx_i * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot);
                 int flag;
                 int data_int64_ptr_offset;
                 if constexpr (kUseLogFMT) {
-                    flag = __shfl_sync(sync_mask, local_flag, i, 16);
+                    flag = __shfl_sync(0xffffffff, local_flag, i, 8);
                     int prefix_uncompressed_cnt = __popc(flag & prefix_channel_group_mask);
                     data_int64_ptr_offset = data_int64_ptr_channel_group_offset_unfixed + prefix_uncompressed_cnt * (16 * 2 - 10 * 2);
                 }
                 float log_amax, log_amin;
-                if ((not kUseLogFMT) or ((flag & channel_group_mask))) {
+                if constexpr (not kUseLogFMT) {
                     auto rdma_buffer_row = reinterpret_cast<const int4*>(rdma_buffer_type);
-
+;
                     // Reduce
-                    auto x_vec = ld_nc_global(rdma_buffer_row + (not kUseLogFMT ? thread_id : data_int64_ptr_offset / (sizeof(int4) / sizeof(int64_t)) + thread_id_in_channel_group));
-                    const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
+                    int4 x_vec[2];
+                    x_vec[0] = ld_nc_global(rdma_buffer_row + (not kUseLogFMT ? thread_id * kUnrollFactor : data_int64_ptr_offset / (sizeof(int4) / sizeof(int64_t)) + thread_id_in_channel_group * kUnrollFactor));
+                    x_vec[1] = ld_nc_global(rdma_buffer_row + (not kUseLogFMT ? thread_id * kUnrollFactor + 1 : data_int64_ptr_offset / (sizeof(int4) / sizeof(int64_t)) + thread_id_in_channel_group * kUnrollFactor + 1));
+                    /*EP_DEVICE_ASSERT(x_vec[0].x==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32)) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[0].y==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32)) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[0].z==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32)) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[0].w==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32)) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[1].x==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32) + 1) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[1].y==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32) + 1) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[1].z==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32) + 1) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[1].w==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32) + 1) * 2 + thread_group_id);*/
+                    const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(x_vec);
                     /*if constexpr (kUseLogFMT) {
                         log_amax = __shfl_sync(sync_mask, log_amax, i, 16);
                         log_amin = __shfl_sync(sync_mask, log_amin, i, 16);
                     }*/
                     #pragma unroll
+                    for (int j = 0; j < kNumElemsPerInt4 * kUnrollFactor; ++ j)
+                        combined_values[j] += static_cast<float>(x_bf16[j]) * reg_topk_weights[i];
+                    /*if constexpr (kUseLogFMT) {
+                        log_amax = __shfl_sync(sync_mask, log_amax, i, 16);
+                        log_amin = __shfl_sync(sync_mask, log_amin, i, 16);
+                    }*/
+                    /*#pragma unroll
                     for (int j = 0; j < kNumElemsPerInt4; ++ j)
+                        combined_values[j] += static_cast<float>(x_bf16[j]) * reg_topk_weights[i];*/
+                } else
+                if (((flag & channel_group_mask))) {
+                    auto rdma_buffer_row = reinterpret_cast<const int4*>(rdma_buffer_type);
+
+                    // Reduce
+                    int4 x_vec[2];
+                    x_vec[0] = ld_nc_global(rdma_buffer_row + (not kUseLogFMT ? thread_id * kUnrollFactor : data_int64_ptr_offset / (sizeof(int4) / sizeof(int64_t)) + thread_id_in_channel_group * kUnrollFactor));
+                    x_vec[1] = ld_nc_global(rdma_buffer_row + (not kUseLogFMT ? thread_id * kUnrollFactor + 1 : data_int64_ptr_offset / (sizeof(int4) / sizeof(int64_t)) + thread_id_in_channel_group * kUnrollFactor + 1));
+                    /*EP_DEVICE_ASSERT(x_vec[0].x==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32)) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[0].y==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32)) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[0].z==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32)) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[0].w==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32)) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[1].x==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32) + 1) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[1].y==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32) + 1) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[1].z==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32) + 1) * 2 + thread_group_id);
+                    EP_DEVICE_ASSERT(x_vec[1].w==(lane_id * kUnrollFactor + channel_group_id_in_segment/4 * (kUnrollFactor * 32) + 1) * 2 + thread_group_id);*/
+                    const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(x_vec);
+                    /*if constexpr (kUseLogFMT) {
+                        log_amax = __shfl_sync(sync_mask, log_amax, i, 16);
+                        log_amin = __shfl_sync(sync_mask, log_amin, i, 16);
+                    }*/
+                    #pragma unroll
+                    for (int j = 0; j < kNumElemsPerInt4 * kUnrollFactor; ++ j)
                         combined_values[j] += static_cast<float>(x_bf16[j]) * reg_topk_weights[i];
                 } else {
                     // Reduce
-                    auto x_vec = ld_nc_global(reinterpret_cast<const int64_t*>(rdma_buffer_type) + (data_int64_ptr_offset + thread_id_in_channel_group));
-                    auto x_uint16 = ld_nc_global(reinterpret_cast<const uint16_t*>(rdma_buffer_type) + (data_int64_ptr_offset * (sizeof(int64_t) / sizeof(uint16_t)) + 16 * (sizeof(int64_t) / sizeof(uint16_t)) + thread_id_in_channel_group));
+                    auto x_vec = ld_nc_global(reinterpret_cast<const int4*>(rdma_buffer_type) + (data_int64_ptr_offset / (sizeof(int4) / sizeof(int64_t)) + thread_id_in_channel_group));
+                    unsigned int x_uint32_4 = ld_nc_global(reinterpret_cast<const int32_t*>(rdma_buffer_type) + (data_int64_ptr_offset * (sizeof(int64_t) / sizeof(int32_t)) + 8 * (sizeof(int4) / sizeof(int32_t)) + thread_id_in_channel_group));
 
                     float2 float_amax_amin_info;
                     if (thread_id_in_channel_group == i) {
@@ -1055,8 +1144,8 @@ if constexpr (kUseLogFMT){
                         log_amax = __logf(float_amax_amin_info.x);
                         log_amin = fmaxf(__logf(float_amax_amin_info.y), log_amax - kMinClip);
                     }
-                    log_amax = __shfl_sync(sync_mask, log_amax, i, 16);
-                    log_amin = __shfl_sync(sync_mask, log_amin, i, 16);
+                    log_amax = __shfl_sync(sync_mask, log_amax, i, 8);
+                    log_amin = __shfl_sync(sync_mask, log_amin, i, 8);
 
                     const auto step = __fdividef(log_amax - log_amin, static_cast<float>(kNumValues - 2));
                     //const auto inv_step = static_cast<float>(kNumValues - 2) / (log_amax - log_amin);
@@ -1077,7 +1166,7 @@ if constexpr (kUseLogFMT){
                     };
 
                     const auto x_uint32 = reinterpret_cast<uint32_t*>(&x_vec);
-                    unsigned int out[kNumElemsPerInt4];
+                    unsigned int out[kNumElemsPerInt4 * kUnrollFactor];
                     out[0] = (x_uint32[0] >> (kNumBits * 2));// & ((1u << kNumBits) - 1);
                     combined_values[0] += decode(out[0]) * reg_topk_weights[i];
                     out[1] = (x_uint32[0] >> kNumBits);// & ((1u << kNumBits) - 1);
@@ -1090,21 +1179,61 @@ if constexpr (kUseLogFMT){
                     combined_values[5] += decode(out[5]) * reg_topk_weights[i];
                     out[6] = (x_uint32[1] >> (32 - kNumBits * 3));// & ((1u << kNumBits) - 1);
                     combined_values[6] += decode(out[6]) * reg_topk_weights[i];
-
-                    out[3] = ((x_uint32[0] >> (kNumBits * 3)) + (x_uint32[1] << (10 - (32 - kNumBits * 3))) + ((x_uint16 & 0b001111110000000000u) >> 8));// & ((1u << kNumBits) - 1);
-                    combined_values[3] += decode(out[3]) * reg_topk_weights[i];
-                    out[7] = x_uint16;// & ((1u << kNumBits) - 1);
+                    out[7] = (x_uint32[2] >> (kNumBits * 2));// & ((1u << kNumBits) - 1);
                     combined_values[7] += decode(out[7]) * reg_topk_weights[i];
+                    out[8] = (x_uint32[2] >> kNumBits);// & ((1u << kNumBits) - 1);
+                    combined_values[8] += decode(out[8]) * reg_topk_weights[i];
+                    out[9] = x_uint32[2];// & ((1u << kNumBits) - 1);
+                    combined_values[9] += decode(out[9]) * reg_topk_weights[i];
+                    out[10] = (x_uint32[3] >> (kNumBits * 2));// & ((1u << kNumBits) - 1);
+                    combined_values[10] += decode(out[10]) * reg_topk_weights[i];
+                    out[11] = (x_uint32[3] >> kNumBits);// & ((1u << kNumBits) - 1);
+                    combined_values[11] += decode(out[11]) * reg_topk_weights[i];
+                    out[12] = x_uint32[3];// & ((1u << kNumBits) - 1);
+                    combined_values[12] += decode(out[12]) * reg_topk_weights[i];
+                    out[13] = (x_uint32_4 >> (kNumBits * 2));// & ((1u << kNumBits) - 1);
+                    combined_values[13] += decode(out[13]) * reg_topk_weights[i];
+                    out[14] = (x_uint32_4 >> kNumBits);// & ((1u << kNumBits) - 1);
+                    combined_values[14] += decode(out[14]) * reg_topk_weights[i];
+                    out[15] = x_uint32_4;// & ((1u << kNumBits) - 1);
+                    combined_values[15] += decode(out[15]) * reg_topk_weights[i];
+
+                    out[3] = ((x_uint32[0] >> (kNumBits * 3)) + (x_uint32[1] << (10 - (32 - kNumBits * 3))) + ((x_uint32[2]&0xc0000000) >> 28) + ((x_uint32[3]&0xc0000000) >> 26) + ((x_uint32_4&0xc0000000) >> 24));// & ((1u << kNumBits) - 1);
+                    combined_values[3] += decode(out[3]) * reg_topk_weights[i];
+                    /*out[7] = x_uint16;// & ((1u << kNumBits) - 1);
+                    combined_values[7] += decode(out[7]) * reg_topk_weights[i];*/
+                    /*EP_DEVICE_ASSERT(round(decode(out[0 * 2 + 1])) == -4);
+                    //EP_DEVICE_ASSERT(round(decode(out[1 * 2 + 1])) == -4);
+                    EP_DEVICE_ASSERT(round(decode(out[2 * 2 + 1])) == -4);
+                    EP_DEVICE_ASSERT(round(decode(out[3 * 2 + 1])) == -4);
+                    EP_DEVICE_ASSERT(round(decode(out[4 * 2 + 1])) == -4);
+                    EP_DEVICE_ASSERT(round(decode(out[5 * 2 + 1])) == -4);
+                    EP_DEVICE_ASSERT(round(decode(out[6 * 2 + 1])) == -4);
+                    EP_DEVICE_ASSERT(round(decode(out[7 * 2 + 1])) == -4);
+                    for (int j = 0; j < kNumElemsPerInt4; j++) {
+                        ;
+                    EP_DEVICE_ASSERT(round(decode(out[j * 2])) == 3);
+                    if (j!=1)
+                    EP_DEVICE_ASSERT(round(decode(out[j * 2 + 1])) == -4);
+                    }*/
                 }
             }
 
             // Write results
-            int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
+            //nv_bfloat16 combined_result[kNumElemsPerInt4 * 2];
+            
+            int4* combined_int4 = reinterpret_cast<int4*>(combined_values);
             auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
             #pragma unroll
-            for (int j = 0; j < kNumElemsPerInt4; ++ j)
+            for (int j = 0; j < kNumElemsPerInt4 * kUnrollFactor; ++ j)
                 combined_bf16[j] = static_cast<nv_bfloat16>(combined_values[j]);
-            (static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
+                /*
+            #pragma unroll
+            for (int j = 0; j < kNumElemsPerInt4 * kUnrollFactor; ++ j)
+                combined_result[j] = static_cast<nv_bfloat16>(combined_values[j]);
+            const int4* combined_int4 = reinterpret_cast<const int4*>(combined_result);*/
+            (static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id * kUnrollFactor] = combined_int4[0];
+            (static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id * kUnrollFactor + 1] = combined_int4[1];
         }
     }
 }
