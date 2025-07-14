@@ -503,13 +503,15 @@ combine(void* combined_x,
                         const auto step = (log_amax - log_amin) / static_cast<float>(kNumValues - 2);
                         const auto step_inv = 1.0f / step;
                         const auto rounding = 2.0f - log2f_approx((1.0f + exp2f_approx(step)) * 0.5f) * step_inv;
+                        const auto rounding_fuse_amin = 2.0f - (log2f_approx((1.0f + exp2f_approx(step)) * 0.5f) + log_amin) * step_inv;
+                        const auto step_fuse_amin = log_amin - step;
 
                         // Use LogFMT only with `amax <= kThreshold` (maybe not all quarter-warps)
                         if (amax <= kThreshold and log_amin < log_amax) {
                             // Transform
                             auto transform = [=](const float& log_abs_value) -> nv_bfloat16 {
-                                const auto encoded = floorf((log_abs_value - log_amin) * step_inv + rounding);
-                                const auto decoded = exp2f_approx((encoded - 1) * step + log_amin);
+                                const auto encoded = floorf(log_abs_value * step_inv + rounding_fuse_amin); // equals to `floorf((log_abs_value - log_amin) * step_inv + rounding)`
+                                const auto decoded = exp2f_approx(encoded * step + step_fuse_amin); // equals to `(encoded - 1) * step + log_amin`
                                 return decoded; 
                             };
                             #pragma unroll
